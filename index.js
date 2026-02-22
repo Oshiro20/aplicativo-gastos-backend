@@ -26,16 +26,22 @@ app.post('/api/parse-voice', async (req, res) => {
             return res.status(400).json({ error: 'Faltan parámetros: systemPrompt o userMessage' });
         }
 
+        const payload = {
+            model: 'llama-3.3-70b-versatile',
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userMessage }
+            ]
+        };
+
+        // Si el prompt explícitamente pide JSON (ej. parseVoiceTransaction), activamos el modo JSON de Groq
+        if (systemPrompt.includes('JSON EXACTO')) {
+            payload.response_format = { type: 'json_object' };
+        }
+
         const response = await axios.post(
             'https://api.groq.com/openai/v1/chat/completions',
-            {
-                model: 'llama-3.3-70b-versatile',
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userMessage }
-                ],
-                response_format: { type: 'json_object' },
-            },
+            payload,
             {
                 headers: {
                     'Authorization': `Bearer ${GROQ_API_KEY}`,
