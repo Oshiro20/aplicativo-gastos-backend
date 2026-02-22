@@ -53,7 +53,8 @@ app.post('/api/parse-voice', async (req, res) => {
         res.json(response.data);
     } catch (error) {
         console.error('Error in /api/parse-voice:', error.response?.data || error.message);
-        res.status(500).json({ error: 'Error procesando la solicitud en la IA' });
+        const realError = error.response?.data?.error?.message || error.message || 'Error procesando la solicitud en la IA';
+        res.status(500).json({ error: realError });
     }
 });
 
@@ -93,7 +94,8 @@ app.post('/api/parse-receipt', async (req, res) => {
         res.json(response.data);
     } catch (error) {
         console.error('Error in /api/parse-receipt:', error.response?.data || error.message);
-        res.status(500).json({ error: 'Error procesando el recibo visual' });
+        const realError = error.response?.data?.error?.message || error.message || 'Error procesando el recibo visual';
+        res.status(500).json({ error: realError });
     }
 });
 
