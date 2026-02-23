@@ -81,7 +81,7 @@ app.post('/api/parse-receipt', async (req, res) => {
                         ]
                     }
                 ],
-                response_format: { type: 'json_object' },
+                ...(systemPrompt.toLowerCase().includes('json') && { response_format: { type: 'json_object' } }),
             },
             {
                 headers: {
