@@ -63,23 +63,20 @@ app.post('/api/parse-receipt', async (req, res) => {
     try {
         const { systemPrompt, textContent, base64Image } = req.body;
 
-        if (!systemPrompt || !base64Image) {
-            return res.status(400).json({ error: 'Faltan parámetros: systemPrompt o base64Image' });
+        // "base64Image" actually contains the raw OCR text coming from the legacy Flutter payload
+        const ocrText = textContent || base64Image;
+
+        if (!systemPrompt || !ocrText) {
+            return res.status(400).json({ error: 'Faltan parámetros: systemPrompt o data del recibo' });
         }
 
         const response = await axios.post(
             'https://api.groq.com/openai/v1/chat/completions',
             {
-                model: 'llama-3.2-90b-vision-preview',
+                model: 'llama-3.3-70b-versatile',
                 messages: [
                     { role: 'system', content: systemPrompt },
-                    {
-                        role: 'user',
-                        content: [
-                            { type: 'text', text: textContent || 'Analiza este voucher.' },
-                            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
-                        ]
-                    }
+                    { role: 'user', content: ocrText }
                 ],
                 ...(systemPrompt.toLowerCase().includes('json') && { response_format: { type: 'json_object' } }),
             },
