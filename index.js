@@ -73,6 +73,26 @@ async function ensureCloudSchema() {
         );
     `);
 
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS ecosystem_summaries (
+            user_id INTEGER PRIMARY KEY REFERENCES wallet_users(id) ON DELETE CASCADE,
+            payload_json JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS ecosystem_pending_tx (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES wallet_users(id) ON DELETE CASCADE,
+            source TEXT NOT NULL DEFAULT 'mylifeos',
+            payload_json JSONB NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            acked_at TIMESTAMPTZ
+        );
+    `);
+
     schemaReady = true;
     return true;
 }
@@ -170,7 +190,16 @@ function formatBackupMeta(row) {
 
 // ─── Utilidades de IA (Gemini + Groq Fallback) ────────────────────────────────
 
-async function callGemini({ systemPrompt, userMessage, expectJson, model }) {
+async function callGemini({
+    systemPrompt,
+    userMessage,
+    expectJson,
+    model,
+    mediaBase64,
+    mediaMimeType,
+    mediaItems,
+    history,
+}) {
     if (!GEMINI_API_KEY) {
         const err = new Error('GEMINI_API_KEY no configurada');
         err.statusCode = 401;
@@ -178,16 +207,51 @@ async function callGemini({ systemPrompt, userMessage, expectJson, model }) {
     }
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-    const body = {
-        systemInstruction: {
-            parts: [{ text: systemPrompt }],
-        },
-        contents: [
-            {
-                role: 'user',
-                parts: [{ text: userMessage }],
+
+    const userParts = [{ text: userMessage }];
+    if (mediaBase64 && mediaMimeType) {
+        userParts.push({
+            inlineData: {
+                mimeType: mediaMimeType,
+                data: mediaBase64,
             },
-        ],
+        });
+    }
+    if (Array.isArray(mediaItems)) {
+        for (const item of mediaItems) {
+            if (item && item.base64 && item.mimeType) {
+                userParts.push({
+                    inlineData: {
+                        mimeType: String(item.mimeType),
+                        data: String(item.base64),
+                    },
+                });
+            }
+        }
+    }
+
+    const contents = [];
+    if (Array.isArray(history)) {
+        for (const item of history) {
+            if (!item || !item.text) continue;
+            contents.push({
+                role: item.role === 'model' ? 'model' : 'user',
+                parts: [{ text: String(item.text) }],
+            });
+        }
+    }
+    contents.push({
+        role: 'user',
+        parts: userParts,
+    });
+
+    const body = {
+        ...(systemPrompt && {
+            systemInstruction: {
+                parts: [{ text: systemPrompt }],
+            },
+        }),
+        contents,
         ...(expectJson && {
             generationConfig: {
                 responseMimeType: 'application/json',
@@ -197,7 +261,7 @@ async function callGemini({ systemPrompt, userMessage, expectJson, model }) {
 
     const response = await axios.post(url, body, {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 45000,
+        timeout: 60000,
     });
 
     const parts = response.data?.candidates?.[0]?.content?.parts || [];
@@ -210,23 +274,36 @@ async function callGemini({ systemPrompt, userMessage, expectJson, model }) {
 
     return {
         provider: `gemini:${model}`,
+        text,
         choices: [{ message: { role: 'assistant', content: text } }],
     };
 }
 
-async function callGroq({ systemPrompt, userMessage, expectJson }) {
+async function callGroq({ systemPrompt, userMessage, expectJson, history }) {
     if (!GROQ_API_KEY) {
         const err = new Error('GROQ_API_KEY no configurada');
         err.statusCode = 401;
         throw err;
     }
 
+    const messages = [];
+    if (systemPrompt) {
+        messages.push({ role: 'system', content: systemPrompt });
+    }
+    if (Array.isArray(history)) {
+        for (const item of history) {
+            if (!item || !item.text) continue;
+            messages.push({
+                role: item.role === 'model' ? 'assistant' : 'user',
+                content: String(item.text),
+            });
+        }
+    }
+    messages.push({ role: 'user', content: userMessage });
+
     const payload = {
         model: GROQ_MODEL,
-        messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
-        ],
+        messages,
         ...(expectJson && { response_format: { type: 'json_object' } }),
     };
 
@@ -242,14 +319,25 @@ async function callGroq({ systemPrompt, userMessage, expectJson }) {
         }
     );
 
+    const text = response.data?.choices?.[0]?.message?.content || '';
     return {
         ...response.data,
+        text,
         provider: `groq:${GROQ_MODEL}`,
     };
 }
 
-async function generateAIResponse({ systemPrompt, userMessage, expectJson }) {
+async function generateAIResponse({
+    systemPrompt,
+    userMessage,
+    expectJson,
+    mediaBase64,
+    mediaMimeType,
+    mediaItems,
+    history,
+}) {
     const errors = [];
+    const hasMedia = Boolean(mediaBase64) || (Array.isArray(mediaItems) && mediaItems.length > 0);
 
     if (GEMINI_API_KEY) {
         const modelsToTry = [GEMINI_MODEL];
@@ -259,7 +347,16 @@ async function generateAIResponse({ systemPrompt, userMessage, expectJson }) {
 
         for (const model of modelsToTry) {
             try {
-                return await callGemini({ systemPrompt, userMessage, expectJson, model });
+                return await callGemini({
+                    systemPrompt,
+                    userMessage,
+                    expectJson,
+                    model,
+                    mediaBase64,
+                    mediaMimeType,
+                    mediaItems,
+                    history,
+                });
             } catch (err) {
                 const status = err.response?.status || err.statusCode || 500;
                 const msg = err.response?.data?.error?.message || err.message;
@@ -269,9 +366,9 @@ async function generateAIResponse({ systemPrompt, userMessage, expectJson }) {
         }
     }
 
-    if (GROQ_API_KEY) {
+    if (GROQ_API_KEY && !hasMedia) {
         try {
-            return await callGroq({ systemPrompt, userMessage, expectJson });
+            return await callGroq({ systemPrompt, userMessage, expectJson, history });
         } catch (err) {
             const status = err.response?.status || err.statusCode || 500;
             const msg = err.response?.data?.error?.message || err.message;
@@ -346,6 +443,41 @@ app.post('/api/parse-receipt', async (req, res) => {
         const status = error.statusCode || 500;
         return res.status(status).json({
             error: error.message || 'Error procesando el recibo visual',
+        });
+    }
+});
+
+// Proxy genérico de IA (texto, chat multi-turno y visión/audio base64 para el ecosistema)
+app.post('/api/ai/generate', async (req, res) => {
+    try {
+        const {
+            systemPrompt,
+            userMessage,
+            expectJson = false,
+            mediaBase64,
+            mediaMimeType,
+            mediaItems,
+            history,
+        } = req.body || {};
+
+        if (!userMessage || typeof userMessage !== 'string') {
+            return res.status(400).json({ error: 'Falta parámetro obligatorio: userMessage' });
+        }
+
+        const result = await generateAIResponse({
+            systemPrompt: systemPrompt ? String(systemPrompt) : undefined,
+            userMessage: String(userMessage),
+            expectJson: Boolean(expectJson),
+            mediaBase64: mediaBase64 ? String(mediaBase64) : undefined,
+            mediaMimeType: mediaMimeType ? String(mediaMimeType) : undefined,
+            mediaItems: Array.isArray(mediaItems) ? mediaItems : undefined,
+            history,
+        });
+        return res.json(result);
+    } catch (error) {
+        const status = error.statusCode || 500;
+        return res.status(status).json({
+            error: error.message || 'Error procesando la solicitud en la IA',
         });
     }
 });
@@ -587,6 +719,191 @@ app.get('/api/backup/download', requireAuth, async (req, res) => {
     } catch (error) {
         console.error('[BACKUP] download error:', error.message);
         return res.status(500).json({ error: 'No se pudo descargar el respaldo desde la nube.' });
+    }
+});
+
+// ─── Endpoints de Ecosistema (WalletAI <-> MyLifeOS) ──────────────────────────
+
+app.put('/api/ecosystem/summary', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({
+                error: 'CLOUD_DB_NOT_CONFIGURED',
+                message: 'El almacenamiento en nube requiere configurar DATABASE_URL en Render.',
+            });
+        }
+
+        const payload = req.body;
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            return res.status(400).json({ error: 'Payload de resumen inválido.' });
+        }
+
+        const pool = getPool();
+        const result = await pool.query(
+            `INSERT INTO ecosystem_summaries (user_id, payload_json, updated_at)
+             VALUES ($1, $2::jsonb, NOW())
+             ON CONFLICT (user_id) DO UPDATE SET
+                payload_json = EXCLUDED.payload_json,
+                updated_at = NOW()
+             RETURNING updated_at`,
+            [req.user.id, JSON.stringify(payload)]
+        );
+
+        return res.json({
+            success: true,
+            updatedAt: new Date(result.rows[0].updated_at).toISOString(),
+        });
+    } catch (error) {
+        console.error('[ECOSYSTEM] summary put error:', error.message);
+        return res.status(500).json({ error: 'No se pudo publicar el resumen del ecosistema.' });
+    }
+});
+
+app.get('/api/ecosystem/summary', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({
+                error: 'CLOUD_DB_NOT_CONFIGURED',
+                message: 'El almacenamiento en nube requiere configurar DATABASE_URL en Render.',
+            });
+        }
+
+        const pool = getPool();
+        const result = await pool.query(
+            `SELECT payload_json, updated_at
+             FROM ecosystem_summaries
+             WHERE user_id = $1`,
+            [req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                exists: false,
+                error: 'Aún no hay resumen publicado desde WalletAI para esta cuenta.',
+            });
+        }
+
+        const row = result.rows[0];
+        return res.json({
+            exists: true,
+            summary: row.payload_json,
+            updatedAt: new Date(row.updated_at).toISOString(),
+        });
+    } catch (error) {
+        console.error('[ECOSYSTEM] summary get error:', error.message);
+        return res.status(500).json({ error: 'No se pudo obtener el resumen del ecosistema.' });
+    }
+});
+
+app.post('/api/ecosystem/pending-transactions', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({
+                error: 'CLOUD_DB_NOT_CONFIGURED',
+                message: 'El almacenamiento en nube requiere configurar DATABASE_URL en Render.',
+            });
+        }
+
+        const body = req.body || {};
+        const amount = Number(body.amount);
+        if (!Number.isFinite(amount) || amount <= 0) {
+            return res.status(400).json({ error: 'El monto debe ser un número mayor a 0.' });
+        }
+
+        const id = String(body.id || crypto.randomUUID());
+        const source = String(body.source || 'mylifeos');
+        const payload = {
+            id,
+            source,
+            type: body.type === 'income' ? 'income' : 'expense',
+            amount,
+            currency: String(body.currency || 'PEN'),
+            description: String(body.description || 'Compra desde MyLifeOS'),
+            categoryHint: String(body.categoryHint || 'Alimentación'),
+            date: body.date ? String(body.date) : new Date().toISOString(),
+            items: Array.isArray(body.items) ? body.items : [],
+        };
+
+        const pool = getPool();
+        await pool.query(
+            `INSERT INTO ecosystem_pending_tx (id, user_id, source, payload_json, status, created_at)
+             VALUES ($1, $2, $3, $4::jsonb, 'pending', NOW())
+             ON CONFLICT (id) DO UPDATE SET
+                payload_json = EXCLUDED.payload_json,
+                status = 'pending'`,
+            [id, req.user.id, source, JSON.stringify(payload)]
+        );
+
+        return res.status(201).json({
+            success: true,
+            id,
+            transaction: payload,
+        });
+    } catch (error) {
+        console.error('[ECOSYSTEM] pending-tx post error:', error.message);
+        return res.status(500).json({ error: 'No se pudo enviar el movimiento pendiente.' });
+    }
+});
+
+app.get('/api/ecosystem/pending-transactions', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({
+                error: 'CLOUD_DB_NOT_CONFIGURED',
+                message: 'El almacenamiento en nube requiere configurar DATABASE_URL en Render.',
+            });
+        }
+
+        const pool = getPool();
+        const result = await pool.query(
+            `SELECT id, source, payload_json, status, created_at
+             FROM ecosystem_pending_tx
+             WHERE user_id = $1 AND status = 'pending'
+             ORDER BY created_at DESC`,
+            [req.user.id]
+        );
+
+        return res.json({
+            items: result.rows.map((r) => ({
+                ...(typeof r.payload_json === 'object' ? r.payload_json : {}),
+                id: r.id,
+                source: r.source,
+                status: r.status,
+                createdAt: new Date(r.created_at).toISOString(),
+            })),
+        });
+    } catch (error) {
+        console.error('[ECOSYSTEM] pending-tx get error:', error.message);
+        return res.status(500).json({ error: 'No se pudieron consultar los movimientos pendientes.' });
+    }
+});
+
+app.post('/api/ecosystem/pending-transactions/:id/ack', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({
+                error: 'CLOUD_DB_NOT_CONFIGURED',
+                message: 'El almacenamiento en nube requiere configurar DATABASE_URL en Render.',
+            });
+        }
+
+        const pool = getPool();
+        const result = await pool.query(
+            `UPDATE ecosystem_pending_tx
+             SET status = 'processed', acked_at = NOW()
+             WHERE id = $1 AND user_id = $2
+             RETURNING id`,
+            [String(req.params.id), req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Movimiento pendiente no encontrado.' });
+        }
+
+        return res.json({ success: true, id: req.params.id });
+    } catch (error) {
+        console.error('[ECOSYSTEM] pending-tx ack error:', error.message);
+        return res.status(500).json({ error: 'No se pudo confirmar el movimiento.' });
     }
 });
 
