@@ -23,7 +23,10 @@ const MISTRAL_VISION_MODEL = (process.env.MISTRAL_VISION_MODEL || 'pixtral-12b-2
 const CLOUDFLARE_API_TOKEN = (process.env.CLOUDFLARE_API_TOKEN || '').trim();
 const CLOUDFLARE_ACCOUNT_ID = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
 const CLOUDFLARE_MODEL = (
-    process.env.CLOUDFLARE_MODEL || '@cf/meta/llama-3.1-8b-instruct-fp8'
+    process.env.CLOUDFLARE_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
+).trim();
+const CLOUDFLARE_FALLBACK_MODEL = (
+    process.env.CLOUDFLARE_FALLBACK_MODEL || '@cf/meta/llama-3.1-8b-instruct-fast'
 ).trim();
 
 const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || '').trim();
@@ -398,7 +401,7 @@ async function callMistral({
     };
 }
 
-async function callCloudflareAI({ systemPrompt, userMessage, expectJson, history }) {
+async function callCloudflareAI({ systemPrompt, userMessage, expectJson, history, model = CLOUDFLARE_MODEL }) {
     if (!CLOUDFLARE_API_TOKEN || !CLOUDFLARE_ACCOUNT_ID) {
         const err = new Error('CLOUDFLARE_API_TOKEN o CLOUDFLARE_ACCOUNT_ID no configurados');
         err.statusCode = 401;
@@ -408,7 +411,7 @@ async function callCloudflareAI({ systemPrompt, userMessage, expectJson, history
     const messages = buildOpenAIMessages({ systemPrompt, userMessage, history });
     const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/v1/chat/completions`;
     const payload = {
-        model: CLOUDFLARE_MODEL,
+        model,
         messages,
         temperature: expectJson ? 0.2 : 0.4,
         max_tokens: 2048,
@@ -431,7 +434,7 @@ async function callCloudflareAI({ systemPrompt, userMessage, expectJson, history
     return {
         ...response.data,
         text,
-        provider: `cloudflare:${CLOUDFLARE_MODEL}`,
+        provider: `cloudflare:${model}`,
     };
 }
 
@@ -566,8 +569,14 @@ async function generateAIResponse({
         if (!CLOUDFLARE_API_TOKEN || !CLOUDFLARE_ACCOUNT_ID) return;
         candidates.push({
             name: `cloudflare:${CLOUDFLARE_MODEL}`,
-            fn: () => callCloudflareAI({ systemPrompt, userMessage, expectJson, history }),
+            fn: () => callCloudflareAI({ systemPrompt, userMessage, expectJson, history, model: CLOUDFLARE_MODEL }),
         });
+        if (CLOUDFLARE_FALLBACK_MODEL && CLOUDFLARE_FALLBACK_MODEL !== CLOUDFLARE_MODEL) {
+            candidates.push({
+                name: `cloudflare:${CLOUDFLARE_FALLBACK_MODEL}`,
+                fn: () => callCloudflareAI({ systemPrompt, userMessage, expectJson, history, model: CLOUDFLARE_FALLBACK_MODEL }),
+            });
+        }
     };
     const addOpenRouter = () => {
         if (!OPENROUTER_API_KEY) return;
@@ -591,18 +600,18 @@ async function generateAIResponse({
             addMistral(true);
         }
     } else if (resolvedTask === 'fast_json') {
-        // Voz, autocategorización y JSON rápido: preserva cuota de Gemini
-        addMistral(false);
+        // Voz, autocategorización y JSON rápido: Cloudflare 70B -> OpenRouter -> Mistral -> Gemini
         addCloudflare();
         addOpenRouter();
+        addMistral(false);
         addNvidia();
         addGemini();
     } else {
         // Consultor IA, Nutricionista IA y chat analítico
-        addMistral(false);
-        addGemini();
         addCloudflare();
+        addGemini();
         addOpenRouter();
+        addMistral(false);
         addNvidia();
     }
 
