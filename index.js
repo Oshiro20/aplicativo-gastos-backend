@@ -13,16 +13,35 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
-const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-3-flash-preview').trim();
-const GEMINI_FALLBACK_MODEL = (process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.1-flash-lite-preview').trim();
+const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
+const GEMINI_FALLBACK_MODEL = (process.env.GEMINI_FALLBACK_MODEL || 'gemini-2.5-flash-lite').trim();
 
-const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim();
-const GROQ_MODEL = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').trim();
+const MISTRAL_API_KEY = (process.env.MISTRAL_API_KEY || '').trim();
+const MISTRAL_MODEL = (process.env.MISTRAL_MODEL || 'mistral-small-latest').trim();
+const MISTRAL_VISION_MODEL = (process.env.MISTRAL_VISION_MODEL || 'pixtral-12b-2409').trim();
+
+const CLOUDFLARE_API_TOKEN = (process.env.CLOUDFLARE_API_TOKEN || '').trim();
+const CLOUDFLARE_ACCOUNT_ID = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
+const CLOUDFLARE_MODEL = (
+    process.env.CLOUDFLARE_MODEL || '@cf/meta/llama-3.1-8b-instruct-fp8'
+).trim();
+
+const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || '').trim();
+const OPENROUTER_MODELS = (
+    process.env.OPENROUTER_MODELS ||
+    'openrouter/free,mistralai/mistral-small-3.1-24b-instruct:free,meta-llama/llama-3.3-70b-instruct:free,google/gemma-3-27b-it:free'
+)
+    .split(',')
+    .map((m) => m.trim())
+    .filter(Boolean);
+
+const NVIDIA_API_KEY = (process.env.NVIDIA_API_KEY || '').trim();
+const NVIDIA_MODEL = (process.env.NVIDIA_MODEL || 'meta/llama-3.3-70b-instruct').trim();
 
 const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
 const TOKEN_SECRET = (
     process.env.TOKEN_SECRET ||
-    crypto.createHash('sha256').update(`walletai:${GEMINI_API_KEY}:${GROQ_API_KEY}`).digest('hex')
+    crypto.createHash('sha256').update(`walletai:${GEMINI_API_KEY}:cloud`).digest('hex')
 ).trim();
 
 // ─── PostgreSQL (Opcional para Cuenta en Nube y Respaldo) ─────────────────────
@@ -188,7 +207,49 @@ function formatBackupMeta(row) {
     };
 }
 
-// ─── Utilidades de IA (Gemini + Groq Fallback) ────────────────────────────────
+// ─── Utilidades de IA (Router Multi-Proveedor: Gemini + Mistral + Cloudflare + OpenRouter) ─
+
+function buildOpenAIMessages({ systemPrompt, userMessage, history, mediaBase64, mediaMimeType, mediaItems }) {
+    const messages = [];
+    if (systemPrompt) {
+        messages.push({ role: 'system', content: systemPrompt });
+    }
+    if (Array.isArray(history)) {
+        for (const item of history) {
+            if (!item || !item.text) continue;
+            messages.push({
+                role: item.role === 'model' ? 'assistant' : 'user',
+                content: String(item.text),
+            });
+        }
+    }
+
+    const images = [];
+    if (mediaBase64 && mediaMimeType && String(mediaMimeType).startsWith('image/')) {
+        images.push({ mimeType: String(mediaMimeType), base64: String(mediaBase64) });
+    }
+    if (Array.isArray(mediaItems)) {
+        for (const item of mediaItems) {
+            if (item && item.base64 && item.mimeType && String(item.mimeType).startsWith('image/')) {
+                images.push({ mimeType: String(item.mimeType), base64: String(item.base64) });
+            }
+        }
+    }
+
+    if (images.length > 0) {
+        const content = [{ type: 'text', text: userMessage }];
+        for (const img of images) {
+            content.push({
+                type: 'image_url',
+                image_url: { url: `data:${img.mimeType};base64,${img.base64}` },
+            });
+        }
+        messages.push({ role: 'user', content });
+    } else {
+        messages.push({ role: 'user', content: userMessage });
+    }
+    return messages;
+}
 
 async function callGemini({
     systemPrompt,
@@ -279,100 +340,281 @@ async function callGemini({
     };
 }
 
-async function callGroq({ systemPrompt, userMessage, expectJson, history }) {
-    if (!GROQ_API_KEY) {
-        const err = new Error('GROQ_API_KEY no configurada');
+async function callMistral({
+    systemPrompt,
+    userMessage,
+    expectJson,
+    history,
+    mediaBase64,
+    mediaMimeType,
+    mediaItems,
+    useVision = false,
+}) {
+    if (!MISTRAL_API_KEY) {
+        const err = new Error('MISTRAL_API_KEY no configurada');
         err.statusCode = 401;
         throw err;
     }
 
-    const messages = [];
-    if (systemPrompt) {
-        messages.push({ role: 'system', content: systemPrompt });
-    }
-    if (Array.isArray(history)) {
-        for (const item of history) {
-            if (!item || !item.text) continue;
-            messages.push({
-                role: item.role === 'model' ? 'assistant' : 'user',
-                content: String(item.text),
-            });
-        }
-    }
-    messages.push({ role: 'user', content: userMessage });
+    const model = useVision ? MISTRAL_VISION_MODEL : MISTRAL_MODEL;
+    const messages = buildOpenAIMessages({
+        systemPrompt,
+        userMessage,
+        history,
+        mediaBase64: useVision ? mediaBase64 : undefined,
+        mediaMimeType: useVision ? mediaMimeType : undefined,
+        mediaItems: useVision ? mediaItems : undefined,
+    });
 
     const payload = {
-        model: GROQ_MODEL,
+        model,
         messages,
-        ...(expectJson && { response_format: { type: 'json_object' } }),
+        temperature: expectJson ? 0.2 : 0.4,
+        ...(expectJson && !useVision && { response_format: { type: 'json_object' } }),
     };
 
     const response = await axios.post(
-        'https://api.groq.com/openai/v1/chat/completions',
+        'https://api.mistral.ai/v1/chat/completions',
         payload,
         {
             headers: {
-                Authorization: `Bearer ${GROQ_API_KEY}`,
+                Authorization: `Bearer ${MISTRAL_API_KEY}`,
                 'Content-Type': 'application/json',
             },
             timeout: 45000,
         }
     );
 
-    const text = response.data?.choices?.[0]?.message?.content || '';
+    const text = (response.data?.choices?.[0]?.message?.content || '').trim();
+    if (!text) {
+        const err = new Error('Mistral devolvió una respuesta vacía');
+        err.statusCode = 502;
+        throw err;
+    }
     return {
         ...response.data,
         text,
-        provider: `groq:${GROQ_MODEL}`,
+        provider: `mistral:${model}`,
+    };
+}
+
+async function callCloudflareAI({ systemPrompt, userMessage, expectJson, history }) {
+    if (!CLOUDFLARE_API_TOKEN || !CLOUDFLARE_ACCOUNT_ID) {
+        const err = new Error('CLOUDFLARE_API_TOKEN o CLOUDFLARE_ACCOUNT_ID no configurados');
+        err.statusCode = 401;
+        throw err;
+    }
+
+    const messages = buildOpenAIMessages({ systemPrompt, userMessage, history });
+    const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/v1/chat/completions`;
+    const payload = {
+        model: CLOUDFLARE_MODEL,
+        messages,
+        temperature: expectJson ? 0.2 : 0.4,
+        max_tokens: 2048,
+    };
+
+    const response = await axios.post(url, payload, {
+        headers: {
+            Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+            'Content-Type': 'application/json',
+        },
+        timeout: 40000,
+    });
+
+    const text = (response.data?.choices?.[0]?.message?.content || '').trim();
+    if (!text) {
+        const err = new Error('Cloudflare Workers AI devolvió una respuesta vacía');
+        err.statusCode = 502;
+        throw err;
+    }
+    return {
+        ...response.data,
+        text,
+        provider: `cloudflare:${CLOUDFLARE_MODEL}`,
+    };
+}
+
+async function callOpenRouter({ systemPrompt, userMessage, expectJson, history }) {
+    if (!OPENROUTER_API_KEY) {
+        const err = new Error('OPENROUTER_API_KEY no configurada');
+        err.statusCode = 401;
+        throw err;
+    }
+
+    const messages = buildOpenAIMessages({ systemPrompt, userMessage, history });
+    let lastError = null;
+
+    for (const model of OPENROUTER_MODELS) {
+        try {
+            const payload = {
+                model,
+                messages,
+                temperature: expectJson ? 0.2 : 0.4,
+            };
+            const response = await axios.post(
+                'https://openrouter.ai/api/v1/chat/completions',
+                payload,
+                {
+                    headers: {
+                        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+                        'Content-Type': 'application/json',
+                        'HTTP-Referer': 'https://api-gastos-6iri.onrender.com',
+                        'X-Title': 'WalletAI-MyLifeOS',
+                    },
+                    timeout: 45000,
+                }
+            );
+            const text = (response.data?.choices?.[0]?.message?.content || '').trim();
+            if (text) {
+                return {
+                    ...response.data,
+                    text,
+                    provider: `openrouter:${model}`,
+                };
+            }
+        } catch (err) {
+            const status = err.response?.status || err.statusCode || 500;
+            const msg = err.response?.data?.error?.message || err.message;
+            console.error(`[AI] OpenRouter (${model}) error ${status}:`, msg);
+            lastError = err;
+        }
+    }
+
+    throw lastError || new Error('OpenRouter no devolvió una respuesta válida');
+}
+
+async function callNvidia({ systemPrompt, userMessage, expectJson, history }) {
+    if (!NVIDIA_API_KEY) {
+        const err = new Error('NVIDIA_API_KEY no configurada');
+        err.statusCode = 401;
+        throw err;
+    }
+    const messages = buildOpenAIMessages({ systemPrompt, userMessage, history });
+    const response = await axios.post(
+        'https://integrate.api.nvidia.com/v1/chat/completions',
+        {
+            model: NVIDIA_MODEL,
+            messages,
+            temperature: expectJson ? 0.2 : 0.4,
+            max_tokens: 2048,
+        },
+        {
+            headers: {
+                Authorization: `Bearer ${NVIDIA_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            timeout: 45000,
+        }
+    );
+    const text = (response.data?.choices?.[0]?.message?.content || '').trim();
+    if (!text) {
+        const err = new Error('NVIDIA NIM devolvió una respuesta vacía');
+        err.statusCode = 502;
+        throw err;
+    }
+    return {
+        ...response.data,
+        text,
+        provider: `nvidia:${NVIDIA_MODEL}`,
     };
 }
 
 async function generateAIResponse({
     systemPrompt,
     userMessage,
-    expectJson,
+    expectJson = false,
     mediaBase64,
     mediaMimeType,
     mediaItems,
     history,
+    taskType = 'auto',
 }) {
     const errors = [];
     const hasMedia = Boolean(mediaBase64) || (Array.isArray(mediaItems) && mediaItems.length > 0);
+    const hasOnlyImages = hasMedia &&
+        (!mediaMimeType || String(mediaMimeType).startsWith('image/')) &&
+        (!Array.isArray(mediaItems) || mediaItems.every((i) => !i?.mimeType || String(i.mimeType).startsWith('image/')));
 
-    if (GEMINI_API_KEY) {
-        const modelsToTry = [GEMINI_MODEL];
+    const resolvedTask = taskType !== 'auto'
+        ? taskType
+        : (hasMedia ? 'vision' : (expectJson ? 'fast_json' : 'chat'));
+
+    const candidates = [];
+
+    const addGemini = () => {
+        if (!GEMINI_API_KEY) return;
+        candidates.push({
+            name: `gemini:${GEMINI_MODEL}`,
+            fn: () => callGemini({ systemPrompt, userMessage, expectJson, model: GEMINI_MODEL, mediaBase64, mediaMimeType, mediaItems, history }),
+        });
         if (GEMINI_FALLBACK_MODEL && GEMINI_FALLBACK_MODEL !== GEMINI_MODEL) {
-            modelsToTry.push(GEMINI_FALLBACK_MODEL);
+            candidates.push({
+                name: `gemini:${GEMINI_FALLBACK_MODEL}`,
+                fn: () => callGemini({ systemPrompt, userMessage, expectJson, model: GEMINI_FALLBACK_MODEL, mediaBase64, mediaMimeType, mediaItems, history }),
+            });
         }
+    };
+    const addMistral = (useVision = false) => {
+        if (!MISTRAL_API_KEY) return;
+        candidates.push({
+            name: `mistral:${useVision ? MISTRAL_VISION_MODEL : MISTRAL_MODEL}`,
+            fn: () => callMistral({ systemPrompt, userMessage, expectJson, history, mediaBase64, mediaMimeType, mediaItems, useVision }),
+        });
+    };
+    const addCloudflare = () => {
+        if (!CLOUDFLARE_API_TOKEN || !CLOUDFLARE_ACCOUNT_ID) return;
+        candidates.push({
+            name: `cloudflare:${CLOUDFLARE_MODEL}`,
+            fn: () => callCloudflareAI({ systemPrompt, userMessage, expectJson, history }),
+        });
+    };
+    const addOpenRouter = () => {
+        if (!OPENROUTER_API_KEY) return;
+        candidates.push({
+            name: 'openrouter',
+            fn: () => callOpenRouter({ systemPrompt, userMessage, expectJson, history }),
+        });
+    };
+    const addNvidia = () => {
+        if (!NVIDIA_API_KEY) return;
+        candidates.push({
+            name: `nvidia:${NVIDIA_MODEL}`,
+            fn: () => callNvidia({ systemPrompt, userMessage, expectJson, history }),
+        });
+    };
 
-        for (const model of modelsToTry) {
-            try {
-                return await callGemini({
-                    systemPrompt,
-                    userMessage,
-                    expectJson,
-                    model,
-                    mediaBase64,
-                    mediaMimeType,
-                    mediaItems,
-                    history,
-                });
-            } catch (err) {
-                const status = err.response?.status || err.statusCode || 500;
-                const msg = err.response?.data?.error?.message || err.message;
-                console.error(`[AI] Gemini (${model}) error ${status}:`, msg);
-                errors.push({ status, msg });
-            }
+    if (hasMedia || resolvedTask === 'vision') {
+        // Fotos/video/audio: Gemini primero; Mistral Pixtral como respaldo si son imágenes
+        addGemini();
+        if (hasOnlyImages) {
+            addMistral(true);
         }
+    } else if (resolvedTask === 'fast_json') {
+        // Voz, autocategorización y JSON rápido: preserva cuota de Gemini
+        addMistral(false);
+        addCloudflare();
+        addOpenRouter();
+        addNvidia();
+        addGemini();
+    } else {
+        // Consultor IA, Nutricionista IA y chat analítico
+        addMistral(false);
+        addGemini();
+        addCloudflare();
+        addOpenRouter();
+        addNvidia();
     }
 
-    if (GROQ_API_KEY && !hasMedia) {
+    for (const candidate of candidates) {
         try {
-            return await callGroq({ systemPrompt, userMessage, expectJson, history });
+            const result = await candidate.fn();
+            console.log(`[AI] OK via ${result.provider} (task=${resolvedTask})`);
+            return result;
         } catch (err) {
             const status = err.response?.status || err.statusCode || 500;
             const msg = err.response?.data?.error?.message || err.message;
-            console.error(`[AI] Groq error ${status}:`, msg);
+            console.error(`[AI] ${candidate.name} error ${status}:`, msg);
             errors.push({ status, msg });
         }
     }
@@ -398,7 +640,13 @@ app.get('/health', (req, res) => {
         ai: {
             geminiConfigured: Boolean(GEMINI_API_KEY),
             geminiModel: GEMINI_MODEL,
-            groqConfigured: Boolean(GROQ_API_KEY),
+            mistralConfigured: Boolean(MISTRAL_API_KEY),
+            mistralModel: MISTRAL_MODEL,
+            cloudflareConfigured: Boolean(CLOUDFLARE_API_TOKEN && CLOUDFLARE_ACCOUNT_ID),
+            cloudflareModel: CLOUDFLARE_MODEL,
+            openRouterConfigured: Boolean(OPENROUTER_API_KEY),
+            openRouterModels: OPENROUTER_MODELS,
+            nvidiaConfigured: Boolean(NVIDIA_API_KEY),
         },
         cloudBackupConfigured: Boolean(DATABASE_URL),
     });
@@ -408,13 +656,19 @@ app.get('/health', (req, res) => {
 
 app.post('/api/parse-voice', async (req, res) => {
     try {
-        const { systemPrompt, userMessage } = req.body;
+        const { systemPrompt, userMessage, taskType } = req.body;
         if (!systemPrompt || !userMessage) {
             return res.status(400).json({ error: 'Faltan parámetros: systemPrompt o userMessage' });
         }
 
-        const expectJson = systemPrompt.includes('JSON EXACTO');
-        const result = await generateAIResponse({ systemPrompt, userMessage, expectJson });
+        const expectJson = systemPrompt.includes('JSON EXACTO') ||
+            systemPrompt.toLowerCase().includes('devuelve únicamente este objeto json');
+        const result = await generateAIResponse({
+            systemPrompt,
+            userMessage,
+            expectJson,
+            taskType: taskType || (expectJson ? 'fast_json' : 'chat'),
+        });
         return res.json(result);
     } catch (error) {
         const status = error.statusCode || 500;
@@ -437,6 +691,7 @@ app.post('/api/parse-receipt', async (req, res) => {
             systemPrompt,
             userMessage: ocrText,
             expectJson,
+            taskType: 'fast_json',
         });
         return res.json(result);
     } catch (error) {
@@ -458,6 +713,7 @@ app.post('/api/ai/generate', async (req, res) => {
             mediaMimeType,
             mediaItems,
             history,
+            taskType = 'auto',
         } = req.body || {};
 
         if (!userMessage || typeof userMessage !== 'string') {
@@ -472,6 +728,7 @@ app.post('/api/ai/generate', async (req, res) => {
             mediaMimeType: mediaMimeType ? String(mediaMimeType) : undefined,
             mediaItems: Array.isArray(mediaItems) ? mediaItems : undefined,
             history,
+            taskType: String(taskType || 'auto'),
         });
         return res.json(result);
     } catch (error) {
