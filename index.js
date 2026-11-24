@@ -13,8 +13,9 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
-const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
-const GEMINI_FALLBACK_MODEL = (process.env.GEMINI_FALLBACK_MODEL || 'gemini-2.5-flash-lite').trim();
+const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-3-flash-preview').trim();
+const GEMINI_FALLBACK_MODEL = (process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.1-flash-lite-preview').trim();
+const GEMINI_EXTRA_FALLBACKS = ['gemini-3.5-flash-lite', 'gemini-2.5-flash'];
 
 const MISTRAL_API_KEY = (process.env.MISTRAL_API_KEY || '').trim();
 const MISTRAL_MODEL = (process.env.MISTRAL_MODEL || 'mistral-small-latest').trim();
@@ -547,14 +548,14 @@ async function generateAIResponse({
 
     const addGemini = () => {
         if (!GEMINI_API_KEY) return;
-        candidates.push({
-            name: `gemini:${GEMINI_MODEL}`,
-            fn: () => callGemini({ systemPrompt, userMessage, expectJson, model: GEMINI_MODEL, mediaBase64, mediaMimeType, mediaItems, history }),
-        });
-        if (GEMINI_FALLBACK_MODEL && GEMINI_FALLBACK_MODEL !== GEMINI_MODEL) {
+        const seen = new Set();
+        const geminiModels = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL, ...GEMINI_EXTRA_FALLBACKS]
+            .map((m) => String(m || '').trim())
+            .filter((m) => m && !seen.has(m) && seen.add(m));
+        for (const model of geminiModels) {
             candidates.push({
-                name: `gemini:${GEMINI_FALLBACK_MODEL}`,
-                fn: () => callGemini({ systemPrompt, userMessage, expectJson, model: GEMINI_FALLBACK_MODEL, mediaBase64, mediaMimeType, mediaItems, history }),
+                name: `gemini:${model}`,
+                fn: () => callGemini({ systemPrompt, userMessage, expectJson, model, mediaBase64, mediaMimeType, mediaItems, history }),
             });
         }
     };
