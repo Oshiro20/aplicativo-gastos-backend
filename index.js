@@ -175,7 +175,7 @@ function base64UrlDecode(str) {
     return Buffer.from(padded, 'base64').toString('utf8');
 }
 
-function signToken(payload, expiresInDays = 60) {
+function signToken(payload, expiresInDays = 365) {
     const header = base64UrlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
     const exp = Math.floor(Date.now() / 1000) + expiresInDays * 86400;
     const body = base64UrlEncode(JSON.stringify({ ...payload, exp }));
@@ -1016,7 +1016,7 @@ app.patch('/api/auth/profile', requireAuth, async (req, res) => {
                 }
                 const currentPassword = String(req.body.currentPassword || '');
                 if (!verifyPassword(currentPassword, current.password_hash)) {
-                    return res.status(401).json({ error: 'Confirma tu contraseña actual para cambiar el nombre de usuario.' });
+                    return res.status(403).json({ error: 'Contraseña actual incorrecta para cambiar el nombre de usuario.' });
                 }
                 const dupUser = await pool.query(
                     'SELECT id FROM wallet_users WHERE username = $1 AND id <> $2',
@@ -1067,7 +1067,7 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
             return res.status(404).json({ error: 'Usuario no encontrado.' });
         }
         if (!verifyPassword(currentPassword, userRes.rows[0].password_hash)) {
-            return res.status(401).json({ error: 'La contraseña actual es incorrecta.' });
+            return res.status(403).json({ error: 'La contraseña actual es incorrecta.' });
         }
 
         await pool.query(
@@ -1093,7 +1093,7 @@ app.post('/api/auth/recovery-key/regenerate', requireAuth, async (req, res) => {
             return res.status(404).json({ error: 'Usuario no encontrado.' });
         }
         if (!verifyPassword(currentPassword, userRes.rows[0].password_hash)) {
-            return res.status(401).json({ error: 'Contraseña actual incorrecta.' });
+            return res.status(403).json({ error: 'Contraseña actual incorrecta.' });
         }
 
         const recoveryKey = generateRecoveryKey();
