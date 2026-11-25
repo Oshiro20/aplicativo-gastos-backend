@@ -76,7 +76,35 @@ async function ensureCloudSchema() {
             id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            display_name TEXT,
+            email TEXT,
+            recovery_key_hash TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    `);
+
+    await pool.query(`ALTER TABLE wallet_users ADD COLUMN IF NOT EXISTS display_name TEXT;`);
+    await pool.query(`ALTER TABLE wallet_users ADD COLUMN IF NOT EXISTS email TEXT;`);
+    await pool.query(`ALTER TABLE wallet_users ADD COLUMN IF NOT EXISTS recovery_key_hash TEXT;`);
+    await pool.query(`ALTER TABLE wallet_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`);
+    await pool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_users_email_lower
+        ON wallet_users (LOWER(email))
+        WHERE email IS NOT NULL AND email <> '';
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS mylifeos_backups (
+            user_id INTEGER PRIMARY KEY REFERENCES wallet_users(id) ON DELETE CASCADE,
+            device_id TEXT NOT NULL,
+            device_name TEXT NOT NULL,
+            schema_version INTEGER NOT NULL DEFAULT 16,
+            includes_photos BOOLEAN NOT NULL DEFAULT FALSE,
+            checksum TEXT NOT NULL,
+            payload_base64 TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
     `);
 
@@ -209,6 +237,44 @@ function formatBackupMeta(row) {
         sizeBytes: row.size_bytes,
         updatedAt: new Date(row.updated_at).toISOString(),
     };
+}
+
+function formatMyLifeOSBackupMeta(row) {
+    if (!row) {
+        return { exists: false };
+    }
+    return {
+        exists: true,
+        deviceId: row.device_id,
+        deviceName: row.device_name,
+        schemaVersion: row.schema_version,
+        includesPhotos: Boolean(row.includes_photos),
+        checksum: row.checksum,
+        sizeBytes: row.size_bytes,
+        updatedAt: new Date(row.updated_at).toISOString(),
+    };
+}
+
+function formatPublicUser(row) {
+    return {
+        id: row.id,
+        username: row.username,
+        displayName: row.display_name || row.username,
+        email: row.email || null,
+        hasRecoveryKey: Boolean(row.recovery_key_hash),
+        createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    };
+}
+
+function generateRecoveryKey() {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const bytes = crypto.randomBytes(12);
+    const chars = Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
+    return `MLO-${chars.slice(0, 4)}-${chars.slice(4, 8)}-${chars.slice(8, 12)}`;
+}
+
+function normalizeRecoveryKey(raw) {
+    return String(raw || '').trim().toUpperCase().replace(/\s+/g, '');
 }
 
 // ─── Utilidades de IA (Router Multi-Proveedor: Gemini + Mistral + Cloudflare + OpenRouter) ─
@@ -762,9 +828,12 @@ app.post('/api/auth/register', async (req, res) => {
 
         const rawUser = String(req.body.username || '').trim().toLowerCase();
         const password = String(req.body.password || '');
+        const displayName = String(req.body.displayName || '').trim() || rawUser;
+        const rawEmail = String(req.body.email || '').trim().toLowerCase();
+        const email = rawEmail.includes('@') ? rawEmail : null;
 
         if (rawUser.length < 3) {
-            return res.status(400).json({ error: 'El usuario o correo debe tener al menos 3 caracteres.' });
+            return res.status(400).json({ error: 'El usuario debe tener al menos 3 caracteres.' });
         }
         if (password.length < 6) {
             return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres.' });
@@ -773,21 +842,34 @@ app.post('/api/auth/register', async (req, res) => {
         const pool = getPool();
         const existing = await pool.query('SELECT id FROM wallet_users WHERE username = $1', [rawUser]);
         if (existing.rows.length > 0) {
-            return res.status(409).json({ error: 'Ese usuario/correo ya está registrado.' });
+            return res.status(409).json({ error: 'Ese nombre de usuario ya está registrado.' });
+        }
+        if (email) {
+            const existingEmail = await pool.query('SELECT id FROM wallet_users WHERE LOWER(email) = $1', [email]);
+            if (existingEmail.rows.length > 0) {
+                return res.status(409).json({ error: 'Ese correo ya está vinculado a otra cuenta.' });
+            }
         }
 
         const passwordHash = hashPassword(password);
+        const recoveryKey = generateRecoveryKey();
+        const recoveryKeyHash = hashPassword(normalizeRecoveryKey(recoveryKey));
+
         const inserted = await pool.query(
-            'INSERT INTO wallet_users (username, password_hash) VALUES ($1, $2) RETURNING id, username, created_at',
-            [rawUser, passwordHash]
+            `INSERT INTO wallet_users (username, password_hash, display_name, email, recovery_key_hash)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, username, display_name, email, recovery_key_hash, created_at`,
+            [rawUser, passwordHash, displayName, email, recoveryKeyHash]
         );
         const user = inserted.rows[0];
         const token = signToken({ id: user.id, username: user.username });
 
         return res.status(201).json({
             token,
-            user: { id: user.id, username: user.username },
+            user: formatPublicUser(user),
+            recoveryKey,
             latestBackup: { exists: false },
+            myLifeOSBackup: { exists: false },
         });
     } catch (error) {
         console.error('[AUTH] register error:', error.message);
@@ -813,7 +895,9 @@ app.post('/api/auth/login', async (req, res) => {
 
         const pool = getPool();
         const result = await pool.query(
-            'SELECT id, username, password_hash FROM wallet_users WHERE username = $1',
+            `SELECT id, username, password_hash, display_name, email, recovery_key_hash, created_at
+             FROM wallet_users
+             WHERE username = $1 OR (email IS NOT NULL AND LOWER(email) = $1)`,
             [rawUser]
         );
 
@@ -824,20 +908,296 @@ app.post('/api/auth/login', async (req, res) => {
         const user = result.rows[0];
         const token = signToken({ id: user.id, username: user.username });
 
-        const backupRes = await pool.query(
-            `SELECT device_id, device_name, schema_version, accounts_count, transactions_count, categories_count, checksum, size_bytes, updated_at
-             FROM wallet_backups WHERE user_id = $1`,
-            [user.id]
-        );
+        const [backupRes, myLifeRes] = await Promise.all([
+            pool.query(
+                `SELECT device_id, device_name, schema_version, accounts_count, transactions_count, categories_count, checksum, size_bytes, updated_at
+                 FROM wallet_backups WHERE user_id = $1`,
+                [user.id]
+            ),
+            pool.query(
+                `SELECT device_id, device_name, schema_version, includes_photos, checksum, size_bytes, updated_at
+                 FROM mylifeos_backups WHERE user_id = $1`,
+                [user.id]
+            ),
+        ]);
 
         return res.json({
             token,
-            user: { id: user.id, username: user.username },
+            user: formatPublicUser(user),
             latestBackup: formatBackupMeta(backupRes.rows[0]),
+            myLifeOSBackup: formatMyLifeOSBackupMeta(myLifeRes.rows[0]),
         });
     } catch (error) {
         console.error('[AUTH] login error:', error.message);
         return res.status(500).json({ error: 'Error al iniciar sesión en la nube.' });
+    }
+});
+
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({ error: 'CLOUD_DB_NOT_CONFIGURED' });
+        }
+        const pool = getPool();
+        const userRes = await pool.query(
+            `SELECT id, username, display_name, email, recovery_key_hash, created_at
+             FROM wallet_users WHERE id = $1`,
+            [req.user.id]
+        );
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado.' });
+        }
+        const [backupRes, myLifeRes] = await Promise.all([
+            pool.query(
+                `SELECT device_id, device_name, schema_version, accounts_count, transactions_count, categories_count, checksum, size_bytes, updated_at
+                 FROM wallet_backups WHERE user_id = $1`,
+                [req.user.id]
+            ),
+            pool.query(
+                `SELECT device_id, device_name, schema_version, includes_photos, checksum, size_bytes, updated_at
+                 FROM mylifeos_backups WHERE user_id = $1`,
+                [req.user.id]
+            ),
+        ]);
+        return res.json({
+            user: formatPublicUser(userRes.rows[0]),
+            latestBackup: formatBackupMeta(backupRes.rows[0]),
+            myLifeOSBackup: formatMyLifeOSBackupMeta(myLifeRes.rows[0]),
+        });
+    } catch (error) {
+        console.error('[AUTH] me error:', error.message);
+        return res.status(500).json({ error: 'No se pudo consultar el perfil.' });
+    }
+});
+
+app.patch('/api/auth/profile', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({ error: 'CLOUD_DB_NOT_CONFIGURED' });
+        }
+        const pool = getPool();
+        const userRes = await pool.query(
+            `SELECT id, username, password_hash, display_name, email, recovery_key_hash, created_at
+             FROM wallet_users WHERE id = $1`,
+            [req.user.id]
+        );
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado.' });
+        }
+        const current = userRes.rows[0];
+
+        const nextDisplayName = req.body.displayName !== undefined
+            ? String(req.body.displayName || '').trim()
+            : current.display_name;
+        const nextEmailRaw = req.body.email !== undefined
+            ? String(req.body.email || '').trim().toLowerCase()
+            : (current.email || '');
+        const nextEmail = nextEmailRaw.length > 0 ? nextEmailRaw : null;
+
+        if (nextEmail && !nextEmail.includes('@')) {
+            return res.status(400).json({ error: 'Ingresa un correo electrónico válido.' });
+        }
+        if (nextEmail && nextEmail !== (current.email || '').toLowerCase()) {
+            const dupEmail = await pool.query(
+                'SELECT id FROM wallet_users WHERE LOWER(email) = $1 AND id <> $2',
+                [nextEmail, current.id]
+            );
+            if (dupEmail.rows.length > 0) {
+                return res.status(409).json({ error: 'Ese correo ya está en uso en otra cuenta.' });
+            }
+        }
+
+        let nextUsername = current.username;
+        if (req.body.username !== undefined) {
+            const candidate = String(req.body.username || '').trim().toLowerCase();
+            if (candidate && candidate !== current.username) {
+                if (candidate.length < 3) {
+                    return res.status(400).json({ error: 'El usuario debe tener al menos 3 caracteres.' });
+                }
+                const currentPassword = String(req.body.currentPassword || '');
+                if (!verifyPassword(currentPassword, current.password_hash)) {
+                    return res.status(401).json({ error: 'Confirma tu contraseña actual para cambiar el nombre de usuario.' });
+                }
+                const dupUser = await pool.query(
+                    'SELECT id FROM wallet_users WHERE username = $1 AND id <> $2',
+                    [candidate, current.id]
+                );
+                if (dupUser.rows.length > 0) {
+                    return res.status(409).json({ error: 'Ese nombre de usuario ya está ocupado.' });
+                }
+                nextUsername = candidate;
+            }
+        }
+
+        const updated = await pool.query(
+            `UPDATE wallet_users
+             SET username = $1, display_name = $2, email = $3, updated_at = NOW()
+             WHERE id = $4
+             RETURNING id, username, display_name, email, recovery_key_hash, created_at`,
+            [nextUsername, nextDisplayName || nextUsername, nextEmail, current.id]
+        );
+        const freshUser = updated.rows[0];
+        const freshToken = signToken({ id: freshUser.id, username: freshUser.username });
+
+        return res.json({
+            success: true,
+            token: freshToken,
+            user: formatPublicUser(freshUser),
+        });
+    } catch (error) {
+        console.error('[AUTH] profile patch error:', error.message);
+        return res.status(500).json({ error: 'No se pudo actualizar el perfil.' });
+    }
+});
+
+app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({ error: 'CLOUD_DB_NOT_CONFIGURED' });
+        }
+        const currentPassword = String(req.body.currentPassword || '');
+        const newPassword = String(req.body.newPassword || '');
+        if (newPassword.length < 6) {
+            return res.status(400).json({ error: 'La nueva contraseña debe tener al menos 6 caracteres.' });
+        }
+
+        const pool = getPool();
+        const userRes = await pool.query('SELECT id, password_hash FROM wallet_users WHERE id = $1', [req.user.id]);
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado.' });
+        }
+        if (!verifyPassword(currentPassword, userRes.rows[0].password_hash)) {
+            return res.status(401).json({ error: 'La contraseña actual es incorrecta.' });
+        }
+
+        await pool.query(
+            'UPDATE wallet_users SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+            [hashPassword(newPassword), req.user.id]
+        );
+        return res.json({ success: true, message: 'Contraseña actualizada correctamente.' });
+    } catch (error) {
+        console.error('[AUTH] change-password error:', error.message);
+        return res.status(500).json({ error: 'No se pudo cambiar la contraseña.' });
+    }
+});
+
+app.post('/api/auth/recovery-key/regenerate', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({ error: 'CLOUD_DB_NOT_CONFIGURED' });
+        }
+        const currentPassword = String(req.body.currentPassword || '');
+        const pool = getPool();
+        const userRes = await pool.query('SELECT id, password_hash FROM wallet_users WHERE id = $1', [req.user.id]);
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado.' });
+        }
+        if (!verifyPassword(currentPassword, userRes.rows[0].password_hash)) {
+            return res.status(401).json({ error: 'Contraseña actual incorrecta.' });
+        }
+
+        const recoveryKey = generateRecoveryKey();
+        const recoveryKeyHash = hashPassword(normalizeRecoveryKey(recoveryKey));
+        await pool.query(
+            'UPDATE wallet_users SET recovery_key_hash = $1, updated_at = NOW() WHERE id = $2',
+            [recoveryKeyHash, req.user.id]
+        );
+        return res.json({ success: true, recoveryKey });
+    } catch (error) {
+        console.error('[AUTH] recovery-key error:', error.message);
+        return res.status(500).json({ error: 'No se pudo generar la clave de recuperación.' });
+    }
+});
+
+app.post('/api/auth/recover-password', async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({ error: 'CLOUD_DB_NOT_CONFIGURED' });
+        }
+        const identifier = String(req.body.identifier || req.body.username || '').trim().toLowerCase();
+        const recoveryKey = normalizeRecoveryKey(req.body.recoveryKey);
+        const newPassword = String(req.body.newPassword || '');
+
+        if (!identifier || !recoveryKey) {
+            return res.status(400).json({ error: 'Ingresa tu usuario/correo y tu clave de recuperación.' });
+        }
+        if (newPassword.length < 6) {
+            return res.status(400).json({ error: 'La nueva contraseña debe tener al menos 6 caracteres.' });
+        }
+
+        const pool = getPool();
+        const userRes = await pool.query(
+            `SELECT id, username, display_name, email, recovery_key_hash, created_at
+             FROM wallet_users
+             WHERE username = $1 OR (email IS NOT NULL AND LOWER(email) = $1)`,
+            [identifier]
+        );
+        if (userRes.rows.length === 0 || !userRes.rows[0].recovery_key_hash) {
+            return res.status(401).json({ error: 'Cuenta no encontrada o sin clave de recuperación configurada.' });
+        }
+        const user = userRes.rows[0];
+        if (!verifyPassword(recoveryKey, user.recovery_key_hash)) {
+            return res.status(401).json({ error: 'Clave de recuperación incorrecta.' });
+        }
+
+        await pool.query(
+            'UPDATE wallet_users SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+            [hashPassword(newPassword), user.id]
+        );
+        const token = signToken({ id: user.id, username: user.username });
+        return res.json({
+            success: true,
+            token,
+            user: formatPublicUser(user),
+            message: 'Contraseña restablecida correctamente.',
+        });
+    } catch (error) {
+        console.error('[AUTH] recover-password error:', error.message);
+        return res.status(500).json({ error: 'No se pudo restablecer la contraseña.' });
+    }
+});
+
+app.post('/api/auth/recover-username', async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({ error: 'CLOUD_DB_NOT_CONFIGURED' });
+        }
+        const email = String(req.body.email || '').trim().toLowerCase();
+        const password = String(req.body.password || '');
+        const recoveryKey = normalizeRecoveryKey(req.body.recoveryKey);
+
+        if (!email || !email.includes('@')) {
+            return res.status(400).json({ error: 'Ingresa el correo electrónico vinculado a tu cuenta.' });
+        }
+        if (!password && !recoveryKey) {
+            return res.status(400).json({ error: 'Ingresa tu contraseña o tu clave de recuperación para verificar identidad.' });
+        }
+
+        const pool = getPool();
+        const userRes = await pool.query(
+            `SELECT id, username, display_name, password_hash, recovery_key_hash
+             FROM wallet_users WHERE LOWER(email) = $1`,
+            [email]
+        );
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ error: 'No encontramos ninguna cuenta con ese correo vinculado.' });
+        }
+
+        const user = userRes.rows[0];
+        const validPass = password && verifyPassword(password, user.password_hash);
+        const validKey = recoveryKey && user.recovery_key_hash && verifyPassword(recoveryKey, user.recovery_key_hash);
+        if (!validPass && !validKey) {
+            return res.status(401).json({ error: 'La contraseña o clave de recuperación no coincide.' });
+        }
+
+        return res.json({
+            success: true,
+            username: user.username,
+            displayName: user.display_name || user.username,
+        });
+    } catch (error) {
+        console.error('[AUTH] recover-username error:', error.message);
+        return res.status(500).json({ error: 'No se pudo recuperar el usuario.' });
     }
 });
 
@@ -1171,6 +1531,134 @@ app.post('/api/ecosystem/pending-transactions/:id/ack', requireAuth, async (req,
     } catch (error) {
         console.error('[ECOSYSTEM] pending-tx ack error:', error.message);
         return res.status(500).json({ error: 'No se pudo confirmar el movimiento.' });
+    }
+});
+
+// ─── Endpoints de Backup en la Nube de MyLifeOS ───────────────────────────────
+
+app.get('/api/mylifeos/backup/status', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({ error: 'CLOUD_DB_NOT_CONFIGURED' });
+        }
+        const pool = getPool();
+        const result = await pool.query(
+            `SELECT device_id, device_name, schema_version, includes_photos, checksum, size_bytes, updated_at
+             FROM mylifeos_backups WHERE user_id = $1`,
+            [req.user.id]
+        );
+        return res.json({
+            latestBackup: formatMyLifeOSBackupMeta(result.rows[0]),
+        });
+    } catch (error) {
+        console.error('[MYLIFEOS-BACKUP] status error:', error.message);
+        return res.status(500).json({ error: 'Error consultando el respaldo de MyLifeOS.' });
+    }
+});
+
+app.post('/api/mylifeos/backup/upload', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({ error: 'CLOUD_DB_NOT_CONFIGURED' });
+        }
+        const {
+            deviceId,
+            deviceName,
+            schemaVersion = 16,
+            includesPhotos = false,
+            checksum,
+            payloadBase64,
+            baseUpdatedAt,
+            force = false,
+        } = req.body || {};
+
+        if (!deviceId || !checksum || !payloadBase64) {
+            return res.status(400).json({ error: 'Faltan datos obligatorios del respaldo de MyLifeOS.' });
+        }
+
+        const pool = getPool();
+        const existingRes = await pool.query(
+            `SELECT device_id, device_name, schema_version, includes_photos, checksum, size_bytes, updated_at
+             FROM mylifeos_backups WHERE user_id = $1`,
+            [req.user.id]
+        );
+
+        if (existingRes.rows.length > 0 && !force) {
+            const current = existingRes.rows[0];
+            const serverIso = new Date(current.updated_at).toISOString();
+            const isDifferentDevice = current.device_id !== deviceId;
+            const clientKnowsVersion =
+                baseUpdatedAt && new Date(baseUpdatedAt).getTime() >= new Date(current.updated_at).getTime();
+
+            if (isDifferentDevice && !clientKnowsVersion) {
+                return res.status(409).json({
+                    error: 'CONFLICT_NEWER_BACKUP',
+                    message: `Otro dispositivo (${current.device_name}) guardó una copia de MyLifeOS más reciente (${serverIso}).`,
+                    latestBackup: formatMyLifeOSBackupMeta(current),
+                });
+            }
+        }
+
+        const sizeBytes = Buffer.byteLength(payloadBase64, 'base64');
+        const upsert = await pool.query(
+            `INSERT INTO mylifeos_backups (
+                user_id, device_id, device_name, schema_version, includes_photos,
+                checksum, payload_base64, size_bytes, updated_at
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+             ON CONFLICT (user_id) DO UPDATE SET
+                device_id = EXCLUDED.device_id,
+                device_name = EXCLUDED.device_name,
+                schema_version = EXCLUDED.schema_version,
+                includes_photos = EXCLUDED.includes_photos,
+                checksum = EXCLUDED.checksum,
+                payload_base64 = EXCLUDED.payload_base64,
+                size_bytes = EXCLUDED.size_bytes,
+                updated_at = NOW()
+             RETURNING device_id, device_name, schema_version, includes_photos, checksum, size_bytes, updated_at`,
+            [
+                req.user.id,
+                String(deviceId),
+                String(deviceName || 'Android'),
+                Number(schemaVersion) || 16,
+                Boolean(includesPhotos),
+                String(checksum),
+                String(payloadBase64),
+                sizeBytes,
+            ]
+        );
+
+        return res.json({
+            success: true,
+            latestBackup: formatMyLifeOSBackupMeta(upsert.rows[0]),
+        });
+    } catch (error) {
+        console.error('[MYLIFEOS-BACKUP] upload error:', error.message);
+        return res.status(500).json({ error: 'No se pudo subir el respaldo de MyLifeOS.' });
+    }
+});
+
+app.get('/api/mylifeos/backup/download', requireAuth, async (req, res) => {
+    try {
+        if (!(await ensureCloudSchema())) {
+            return res.status(503).json({ error: 'CLOUD_DB_NOT_CONFIGURED' });
+        }
+        const pool = getPool();
+        const result = await pool.query(
+            `SELECT device_id, device_name, schema_version, includes_photos, checksum, payload_base64, size_bytes, updated_at
+             FROM mylifeos_backups WHERE user_id = $1`,
+            [req.user.id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Aún no hay respaldo de MyLifeOS en la nube.' });
+        }
+        const row = result.rows[0];
+        return res.json({
+            latestBackup: formatMyLifeOSBackupMeta(row),
+            payloadBase64: row.payload_base64,
+        });
+    } catch (error) {
+        console.error('[MYLIFEOS-BACKUP] download error:', error.message);
+        return res.status(500).json({ error: 'No se pudo descargar el respaldo de MyLifeOS.' });
     }
 });
 
